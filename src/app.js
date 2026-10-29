@@ -7,7 +7,8 @@ const app = express();
 
 // MiddleWares
 
-app.use(cookieParser);
+app.use(cookieParser());
+app.use(express.json());
 app.use(morgan("dev"));
 
 // Routes
