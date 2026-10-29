@@ -6,6 +6,7 @@ const redis = require("../middlewares/redis.middleware");
 const jwt = require("jsonwebtoken");
 const config = require("../config/config");
 const userData = require("../data/userData.json");
+const crypto = require("crypto");
 
 const COOLDOWN_SECONDS = 60;
 const MAX_ATTEMPTS = 5;
@@ -18,7 +19,6 @@ async function sendOTP(req, res) {
 
     const isUserAlreadyRegistered = await userModel.findOne({
       id: id,
-      role: user.role,
     });
 
     if (isUserAlreadyRegistered) {
@@ -53,7 +53,7 @@ async function sendOTP(req, res) {
 
     const otpHash = await bcrypt.hash(String(otp), 10);
 
-    await redis.set(`otp:${id}:${user.role}`, otpHash, "EX", 300);
+    await redis.set(`otp:${id}`, otpHash, "EX", 300);
 
     await sendEmail(
       user.email,
@@ -90,7 +90,17 @@ async function verifyOTP(req, res) {
 
     const { inputOtp } = req.body;
 
-    const storedOtp = await redis.get(`otp:${id}:${user.role}`);
+    const invalidOtpKey = `invalidOtp:${id}`;
+
+    const currentAttempts = await redis.get(invalidOtpKey);
+
+    if (currentAttempts && parseInt(currentAttempts, 10) >= 3) {
+      return res.status(429).json({
+        message: "Too many failed OTP attempts. Please try again after 1 hour.",
+      });
+    }
+
+    const storedOtp = await redis.get(`otp:${id}`);
 
     if (!storedOtp) {
       return res.status(400).json({
@@ -101,15 +111,20 @@ async function verifyOTP(req, res) {
     const matchOtp = await bcrypt.compare(String(inputOtp), storedOtp);
 
     if (!matchOtp) {
+      const attempts = await redis.incr(invalidOtpKey);
+
+      if (attempts === 1) {
+        await redis.expire(invalidOtpKey, 3600);
+      }
+
       return res.status(400).json({
-        message: "OTP invalid",
+        message: `OTP is invalid. ${3 - attempts} attempt(s) remaining.`,
       });
     }
 
     const token = jwt.sign(
       {
         id: id,
-        role: user.role,
       },
       config.JWT_SECRET,
       {
@@ -123,10 +138,11 @@ async function verifyOTP(req, res) {
       sameSite: "strict",
       maxAge: 1000 * 60 * 10,
     });
-    
-    await redis.set(`verified:${id}:${user.role}`, true, "EX", 600);
 
-    await redis.del(`otp:${id}:${user.role}`);
+    await redis.set(`verified:${id}`, true, "EX", 600);
+
+    await redis.del(`otp:${id}`);
+    await redis.del(invalidOtpKey);
 
     res.status(200).json({
       message: "OTP verified successfully",
@@ -153,7 +169,6 @@ async function createUser(req, res) {
 
     const isUserAlreadyExists = await userModel.findOne({
       id: decoded.id,
-      role: decoded.role,
     });
 
     if (isUserAlreadyExists) {
@@ -162,9 +177,7 @@ async function createUser(req, res) {
       });
     }
 
-    const isUserVerifiedInRedis = await redis.get(
-      `verified:${decoded.id}:${decoded.role}`,
-    );
+    const isUserVerifiedInRedis = await redis.get(`verified:${decoded.id}`);
 
     if (!isUserVerifiedInRedis) {
       return res.status(400).json({
@@ -174,9 +187,7 @@ async function createUser(req, res) {
 
     const { password } = req.body;
 
-    const user = userData.find(
-      (s) => s.id === decoded.id && s.role === decoded.role,
-    );
+    const user = userData.find((s) => s.id === decoded.id);
 
     if (!user) {
       return res.status(404).json({
@@ -194,9 +205,16 @@ async function createUser(req, res) {
       password: passwordHash,
     });
 
+    const remainingTime = Math.max(
+      0,
+      decoded.exp - Math.floor(Date.now() / 1000),
+    );
+
+    await redis.set(`bl:${token}`, true, "EX", remainingTime);
+
     res.clearCookie("token");
 
-    redis.del(`verified:${decoded.id}:${decoded.role}`,)
+    await redis.del(`verified:${decoded.id}`);
 
     return res.status(201).json({
       message: "User created successfully",
@@ -209,4 +227,87 @@ async function createUser(req, res) {
   }
 }
 
-module.exports = { sendOTP, verifyOTP, createUser };
+async function loginUser(req, res) {
+  try {
+    const { id, password } = req.body;
+
+    const user = await userModel.findOne({id:id});
+
+    if (!user) {
+      return res.status(401).json({
+        message: "Unauthorized User",
+      });
+    }
+
+    const isPasswordCorrect = await bcrypt.compare(password, user.password);
+
+    if (!isPasswordCorrect) {
+      return res.status(400).json({
+        message: "Password is incorrect",
+      });
+    }
+
+    const sessionId = crypto.randomUUID();
+
+    const accessToken = jwt.sign(
+      {
+        id: user.id,
+        role: user.role,
+        sessionId,
+      },
+      config.JWT_SECRET,
+      {
+        expiresIn: "15m",
+      },
+    );
+
+    const refreshToken = jwt.sign(
+      {
+        id: user.id,
+        role: user.role,
+        sessionId,
+      },
+      config.JWT_SECRET,
+      {
+        expiresIn: "7d",
+      },
+    );
+
+    const sessionKey = `session:${user.id}:${sessionId}`;
+
+    await redis.set(
+      sessionKey,
+      JSON.stringify({
+        userAgent: req.headers["user-agent"],
+        ip: req.ip,
+        createdAt: Date.now().toString,
+      }),
+      "EX",
+      60 * 60 * 24 * 7,
+    );
+
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+      maxAge: 1000 * 60 * 60 * 24 * 7,
+    });
+
+    res.status(200).json({
+      message: "User logged in successfully",
+      user: {
+        id: user.id,
+        username:user.username,
+        role: user.role,
+      },
+      accessToken,
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: "Internet server error during login",
+      error: err.message,
+    });
+  }
+}
+
+module.exports = { sendOTP, verifyOTP, createUser , loginUser };

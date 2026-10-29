@@ -1,5 +1,8 @@
 const userData = require("../data/userData.json");
 const userModel = require("../models/user.model");
+const redis = require("./redis.middleware");
+const jwt = require("jsonwebtoken");
+const config = require("../config/config");
 
 async function findUser(req, res, next) {
   try {
@@ -41,4 +44,48 @@ async function findUser(req, res, next) {
   }
 }
 
-module.exports = { findUser };
+async function blackListToken(req,res,next){
+
+  const isTokenBlackListed = await redis.get(`bl:${token}`);
+
+  if(isTokenBlackListed){
+    return res.status(401).json({
+      message:"Token has been revoked"
+    })
+  }
+
+  next();
+}
+
+async function authMiddleware(req,res,next){
+  const refreshToken = req.cookies.refreshToken;
+
+  if(!refreshToken){
+    return res.status(401).json({
+      message:"Unauthorized"
+    })
+  }
+
+  try{
+    const decoded = jwt.verify(refreshToken, config.JWT_SECRET);
+
+    const sessionExists = await redis.get(`session:${decoded.id}:${decoded.sessionId}`);
+
+    if(!sessionExists){
+      return res.status(401).json({
+        message:"Session expired or logged Out"
+      })
+    }
+
+    req.user = decoded;
+
+    next();
+  }
+  catch(err){
+    return res.status(500).json({
+      message:"Unauthorized or invalid token",
+      error:err.message
+    })
+  }
+}
+module.exports = { findUser , blackListToken , authMiddleware};
