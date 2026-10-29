@@ -1,6 +1,6 @@
 const userModel = require("../models/user.model");
 const sendEmail = require("../services/email.service");
-const { getHTML, getOTP } = require("../utils/utils");
+const { getHTML, getOTP, getRemainingTime } = require("../utils/utils");
 const bcrypt = require("bcryptjs");
 const redis = require("../middlewares/redis.middleware");
 const jwt = require("jsonwebtoken");
@@ -205,12 +205,11 @@ async function createUser(req, res) {
       password: passwordHash,
     });
 
-    const remainingTime = Math.max(
-      0,
-      decoded.exp - Math.floor(Date.now() / 1000),
-    );
+    const remainingTime = getRemainingTime(decoded.exp);
 
-    await redis.set(`bl:${token}`, true, "EX", remainingTime);
+    if (remainingTime > 0) {
+      await redis.set(`bl:${token}`, true, "EX", remainingTime);
+    }
 
     res.clearCookie("token");
 
@@ -220,8 +219,8 @@ async function createUser(req, res) {
       message: "User created successfully",
     });
   } catch (err) {
-    res.status(404).json({
-      message: "Unauthorized",
+    res.status(500).json({
+      message: "Failed to create user",
       error: err.message,
     });
   }
@@ -231,7 +230,7 @@ async function loginUser(req, res) {
   try {
     const { id, password } = req.body;
 
-    const user = await userModel.findOne({id:id});
+    const user = await userModel.findOne({ id: id });
 
     if (!user) {
       return res.status(401).json({
@@ -274,17 +273,20 @@ async function loginUser(req, res) {
     );
 
     const sessionKey = `session:${user.id}:${sessionId}`;
+    const userSessionsKey = `user:sessions:${user.id}`;
 
     await redis.set(
       sessionKey,
       JSON.stringify({
         userAgent: req.headers["user-agent"],
         ip: req.ip,
-        createdAt: Date.now().toString,
+        createdAt: Date.now().toString(),
       }),
       "EX",
       60 * 60 * 24 * 7,
     );
+
+    await redis.sadd(userSessionsKey, sessionKey);
 
     res.cookie("refreshToken", refreshToken, {
       httpOnly: true,
@@ -297,7 +299,7 @@ async function loginUser(req, res) {
       message: "User logged in successfully",
       user: {
         id: user.id,
-        username:user.username,
+        username: user.username,
         role: user.role,
       },
       accessToken,
@@ -310,4 +312,152 @@ async function loginUser(req, res) {
   }
 }
 
-module.exports = { sendOTP, verifyOTP, createUser , loginUser };
+async function logOutUser(req, res) {
+  try {
+    const decoded = req.decoded;
+
+    await redis.del(`session:${decoded.id}:${decoded.sessionId}`);
+
+    const accessToken = req.accessToken;
+
+    const remainingTime = getRemainingTime(decoded.exp);
+
+    if (remainingTime > 0) {
+      await redis.set(`bl:${accessToken}`, true, "EX", remainingTime);
+    }
+
+    res.clearCookie("refreshToken");
+
+    res.status(200).json({
+      message: "User logged out successfully",
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: "Something went wrong",
+      error: err.message,
+    });
+  }
+}
+
+async function getMe(req, res) {
+  try {
+    const decoded = req.decoded;
+
+    const user = await userModel.findOne({
+      id: decoded.id,
+    });
+
+    if (!user) {
+      return res.status(400).json({
+        message: "User not found",
+      });
+    }
+
+    res.status(200).json({
+      message: "User found successfully",
+      user: {
+        username: user.username,
+        id: user.id,
+        role: user.role,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({
+      message: "Can't get user",
+      error: err.message,
+    });
+  }
+}
+
+async function logOutUserFromAll(req, res) {
+  try {
+    const decoded = req.decoded;
+
+    const userSessionsKey = `user:sessions:${decoded.id}`;
+
+    const sessionsKey = await redis.smembers(userSessionsKey);
+
+    if (sessionsKey.length > 1) {
+      await redis.del(...sessionsKey);
+    }
+
+    await redis.del(userSessionsKey);
+
+    const accessToken = req.accessToken;
+    const remainingTime = getRemainingTime(decoded.exp);
+
+    if (remainingTime > 0) {
+      await redis.set(`bl:${accessToken}`, "true", "EX", remainingTime);
+    }
+
+    res.clearCookie("refreshToken");
+
+    res.status(200).json({
+      message: "User logged out successfully from all devices",
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: "Something went wrong",
+      error: err.message,
+    });
+  }
+}
+
+async function tokenRecreate(req, res) {
+  try {
+    const decoded = req.decoded;
+
+    const accessToken = jwt.sign(
+      {
+        id: decoded.id,
+        role: decoded.role,
+        sessionId: decoded.sessionId,
+      },
+      config.JWT_SECRET,
+      {
+        expiresIn: "15m",
+      },
+    );
+
+    const refreshToken = jwt.sign(
+      {
+        id: decoded.id,
+        role: decoded.role,
+        sessionId: decoded.sessionId,
+      },
+      config.JWT_SECRET,
+      {
+        expiresIn: "7d",
+      },
+    );
+
+    res.cookie("refreshtoken", refreshToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+      maxAge: 1000 * 60 * 60 * 24 * 7,
+    });
+
+    res.status(200).json({
+      message: "Token recreate successfully",
+      accessToken,
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: "Something went wrong",
+      error: err.message,
+    });
+  }
+}
+
+
+module.exports = {
+  sendOTP,
+  verifyOTP,
+  createUser,
+  loginUser,
+  logOutUser,
+  getMe,
+  logOutUserFromAll,
+  tokenRecreate
+};

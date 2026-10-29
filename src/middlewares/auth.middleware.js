@@ -44,48 +44,84 @@ async function findUser(req, res, next) {
   }
 }
 
-async function blackListToken(req,res,next){
-
-  const isTokenBlackListed = await redis.get(`bl:${token}`);
-
-  if(isTokenBlackListed){
-    return res.status(401).json({
-      message:"Token has been revoked"
-    })
-  }
-
-  next();
-}
-
-async function authMiddleware(req,res,next){
+async function refreshTokenMiddleware(req, res, next) {
   const refreshToken = req.cookies.refreshToken;
 
-  if(!refreshToken){
+  if (!refreshToken) {
     return res.status(401).json({
-      message:"Unauthorized"
-    })
+      message: "Unauthorized",
+    });
   }
 
-  try{
+  try {
     const decoded = jwt.verify(refreshToken, config.JWT_SECRET);
 
-    const sessionExists = await redis.get(`session:${decoded.id}:${decoded.sessionId}`);
+    const sessionExists = await redis.get(
+      `session:${decoded.id}:${decoded.sessionId}`,
+    );
 
-    if(!sessionExists){
+    if (!sessionExists) {
       return res.status(401).json({
-        message:"Session expired or logged Out"
-      })
+        message: "Session expired or logged Out",
+      });
     }
 
-    req.user = decoded;
+    req.decoded = decoded;
+    req.session = sessionExists;
+    req.refreshToken = refreshToken;
 
     next();
-  }
-  catch(err){
+  } catch (err) {
     return res.status(500).json({
-      message:"Unauthorized or invalid token",
-      error:err.message
-    })
+      message: "Unauthorized or invalid token",
+      error: err.message,
+    });
   }
 }
-module.exports = { findUser , blackListToken , authMiddleware};
+
+async function accessTokenMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  const accessToken = authHeader?.startsWith("Bearer ")
+    ? authHeader.split(" ")[1]
+    : null;
+
+  if (!accessToken) {
+    return res.status(401).json({
+      message: "Unauthorized",
+    });
+  }
+
+  try {
+
+    const isBlacklisted = await redis.get(`bl:${accessToken}`);
+    if (isBlacklisted) {
+      return res.status(401).json({ message: "Token has been revoked" });
+    }
+
+    const decoded = jwt.verify(accessToken, config.JWT_SECRET);
+
+    const sessionExists = await redis.get(
+      `session:${decoded.id}:${decoded.sessionId}`,
+    );
+
+    if (!sessionExists) {
+      return res.status(401).json({
+        message: "Session expired or logged out",
+      });
+    }
+
+    req.decoded = decoded;
+    req.accessToken = accessToken;
+    req.session = sessionExists;
+
+    next();
+  } catch (err) {
+    res.status(401).json({
+      message: "Unauthorized",
+      error: err.message,
+    });
+  }
+}
+
+module.exports = { findUser, refreshTokenMiddleware, accessTokenMiddleware};

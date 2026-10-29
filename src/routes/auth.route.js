@@ -1,8 +1,8 @@
 const express = require("express");
 const {
   findUser,
-  blackListToken,
-  authMiddleware,
+  accessTokenMiddleware,
+  refreshTokenMiddleware,
 } = require("../middlewares/auth.middleware");
 
 const {
@@ -10,6 +10,10 @@ const {
   verifyOTP,
   createUser,
   loginUser,
+  logOutUser,
+  getMe,
+  logOutUserFromAll,
+  tokenRecreate
 } = require("../controller/auth.controller");
 
 const {
@@ -49,10 +53,9 @@ router.post("/verify-otp", validateId, validateOTP, findUser, verifyOTP);
  * @access  Private (Requires valid registration token cookie)
  * @middleware
  *   - validatePassword: Ensures password meets complexity requirements
- *   - blackListToken: Validates active JWT cookie and revokes/blacklists token post-use
  *   - createUser: Hashes password, creates permanent document in DB, and clears temp auth state
  */
-router.post("/create-user", validatePassword, blackListToken, createUser);
+router.post("/create-user", validatePassword, createUser);
 
 /**
  * @route   POST /login
@@ -64,5 +67,17 @@ router.post("/create-user", validatePassword, blackListToken, createUser);
  *   - loginUser: Verifies password hash against DB, generates JWTs, and stores active session in Redis
  */
 router.post("/login", validateId, validatePassword, loginUser);
+
+router.get("/logout", accessTokenMiddleware, logOutUser);
+
+router.get("/get-me", refreshTokenMiddleware, getMe);
+
+router.get(
+  "/logout-all",
+  accessTokenMiddleware,
+  logOutUserFromAll,
+);
+
+router.get("/token-recreate", refreshTokenMiddleware, tokenRecreate);
 
 module.exports = router;

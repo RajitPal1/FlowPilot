@@ -49,4 +49,8 @@ function getHTML(otp){
 </html>`;
 }
 
-module.exports = { getOTP,getHTML };
+function getRemainingTime(exp) {
+  return Math.max(0, exp - Math.floor(Date.now() / 1000));
+}
+
+module.exports = { getOTP,getHTML,getRemainingTime };
