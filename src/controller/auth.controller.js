@@ -11,6 +11,15 @@ const crypto = require("crypto");
 const COOLDOWN_SECONDS = 60;
 const MAX_ATTEMPTS = 5;
 
+// Helper functions
+
+async function checkBlackListedToken(token) {
+  if (!token) return null;
+  return await redis.get(`bl:${token}`);
+}
+
+// Controllers
+
 async function sendOTP(req, res) {
   try {
     const user = req.user;
@@ -161,6 +170,14 @@ async function createUser(req, res) {
   if (!token) {
     return res.status(401).json({
       message: "Unauthorized",
+    });
+  }
+
+  const tokenFound = await checkBlackListedToken(token);
+
+  if (tokenFound) {
+    return res.status(401).json({
+      message: "Token expired or revoked",
     });
   }
 
@@ -450,6 +467,172 @@ async function tokenRecreate(req, res) {
   }
 }
 
+async function sendOtpForForgotPassword(req, res) {
+  try {
+    const { id } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ message: "User ID is required" });
+    }
+
+    const user = await userModel.findOne({ id });
+
+    if (!user) {
+      return res.status(200).json({
+        message: "If an account exists, an OTP has been sent.",
+      });
+    }
+
+    const cooldownKey = `otp:reset:cooldown:${id}`;
+    const isCooldownActive = await redis.get(cooldownKey);
+
+    if (isCooldownActive) {
+      const ttl = await redis.ttl(cooldownKey);
+      return res.status(429).json({
+        message: `Please wait ${ttl} seconds before requesting another OTP`,
+      });
+    }
+
+    const otp = getOTP();
+    const html = getHTML(otp);
+    const otpHash = await bcrypt.hash(String(otp), 10);
+
+    await redis.set(`otp:reset:${id}`, otpHash, "EX", 300);
+
+    await redis.set(cooldownKey, "true", "EX", COOLDOWN_SECONDS);
+
+    await sendEmail(user.email, "OTP Verification", `Your OTP is ${otp}`, html);
+
+    return res.status(200).json({
+      message: "OTP has been sent to your registered email",
+    });
+  } catch (err) {
+    return res.status(500).json({
+      message: "Could not send OTP due to error",
+      error: err.message,
+    });
+  }
+}
+
+async function verifyOTPForForgotPassword(req, res) {
+  try {
+    const { id, otp } = req.body;
+
+    if (!id || !otp) {
+      return res.status(400).json({ message: "ID and OTP are required" });
+    }
+
+    const invalidAttemptsKey = `invalidOtp:reset:${id}`;
+    const currentAttempts = await redis.get(invalidAttemptsKey);
+
+    if (currentAttempts && parseInt(currentAttempts, 10) >= 3) {
+      return res.status(429).json({
+        message: "Too many failed attempts. Please request a new OTP later.",
+      });
+    }
+
+    const storedOtp = await redis.get(`otp:reset:${id}`);
+
+    if (!storedOtp) {
+      return res.status(400).json({ message: "OTP not found or expired" });
+    }
+
+    const matchOtp = await bcrypt.compare(String(otp), storedOtp);
+
+    if (!matchOtp) {
+      const attempts = await redis.incr(invalidAttemptsKey);
+      if (attempts === 1) {
+        await redis.expire(invalidAttemptsKey, 3600);
+      }
+      return res.status(400).json({
+        message: `Incorrect OTP. ${3 - attempts} attempt(s) remaining.`,
+      });
+    }
+
+    const resetToken = jwt.sign(
+      { id, purpose: "password_reset" },
+      config.JWT_SECRET,
+      { expiresIn: "15m" },
+    );
+
+    await redis.del(`otp:reset:${id}`);
+    await redis.del(invalidAttemptsKey);
+
+    res.cookie("resetToken", resetToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+      maxAge: 1000 * 60 * 15,
+    });
+
+    return res.status(200).json({
+      message: "OTP verified successfully. Proceed to reset password.",
+    });
+  } catch (err) {
+    return res.status(500).json({
+      message: "Something went wrong during verification",
+      error: err.message,
+    });
+  }
+}
+
+async function changePassword(req, res) {
+  const token = req.cookies?.resetToken;
+
+  if (!token) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+  const tokenFound = await checkBlackListedToken(token);
+
+  if (tokenFound) {
+    return res.status(401).json({
+      message: "Token expired or revoked",
+    });
+  }
+
+  try {
+    const decoded = jwt.verify(token, config.JWT_SECRET);
+
+    if (decoded.purpose !== "password_reset") {
+      return res.status(403).json({ message: "Invalid token scope" });
+    }
+
+    const { password } = req.body;
+    if (!password) {
+      return res.status(400).json({ message: "New password is required" });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    await userModel.findOneAndUpdate(
+      { id: decoded.id },
+      { password: passwordHash },
+    );
+
+    const userSessionsKey = `user:sessions:${decoded.id}`;
+    const sessionKeys = await redis.smembers(userSessionsKey);
+    if (sessionKeys.length > 0) {
+      await redis.del(...sessionKeys);
+    }
+    await redis.del(userSessionsKey);
+
+    const remainingTime = getRemainingTime(decoded.exp);
+    if (remainingTime > 0) {
+      await redis.set(`bl:${token}`, "true", "EX", remainingTime);
+    }
+
+    res.clearCookie("resetToken");
+
+    return res.status(200).json({
+      message: "Password changed successfully. Please log in again.",
+    });
+  } catch (err) {
+    return res.status(401).json({
+      message: "Unauthorized or token expired",
+      error: err.message,
+    });
+  }
+}
 
 module.exports = {
   sendOTP,
@@ -459,5 +642,8 @@ module.exports = {
   logOutUser,
   getMe,
   logOutUserFromAll,
-  tokenRecreate
+  tokenRecreate,
+  sendOtpForForgotPassword,
+  verifyOTPForForgotPassword,
+  changePassword,
 };

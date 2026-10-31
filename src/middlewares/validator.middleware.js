@@ -33,7 +33,7 @@ const validateId = [
 ];
 
 const validateOTP = [
-  body("inputOtp")
+  body("otp")
     .isNumeric()
     .withMessage("OTP must only contains digits")
     .isLength({ min: 6, max: 6 })

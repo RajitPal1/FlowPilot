@@ -13,7 +13,10 @@ const {
   logOutUser,
   getMe,
   logOutUserFromAll,
-  tokenRecreate
+  tokenRecreate,
+  sendOtpForForgotPassword,
+  verifyOTPForForgotPassword,
+  changePassword,
 } = require("../controller/auth.controller");
 
 const {
@@ -72,12 +75,14 @@ router.get("/logout", accessTokenMiddleware, logOutUser);
 
 router.get("/get-me", refreshTokenMiddleware, getMe);
 
-router.get(
-  "/logout-all",
-  accessTokenMiddleware,
-  logOutUserFromAll,
-);
+router.get("/logout-all", accessTokenMiddleware, logOutUserFromAll);
 
 router.get("/token-recreate", refreshTokenMiddleware, tokenRecreate);
+
+router.post("/send-otp-for-password",validateId, sendOtpForForgotPassword);
+
+router.post("/verify-otp-for-password",validateId,validateOTP, verifyOTPForForgotPassword);
+
+router.post("/change-password",validatePassword, changePassword)
 
 module.exports = router;
